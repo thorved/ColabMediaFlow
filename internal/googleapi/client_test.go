@@ -1,6 +1,7 @@
 package googleapi
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -8,6 +9,20 @@ import (
 	"testing"
 	"time"
 )
+
+func TestRuntimeCreationReportsStructuredFailureReason(t *testing.T) {
+	var job operation
+	err := json.Unmarshal([]byte(`{"done":true,"error":{"code":9,"message":"internal details",
+		"details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"NO_CAPACITY","metadata":{"private":"value"}}]}}`), &job)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &Client{}
+	err = client.waitRuntimeCreation(t.Context(), job)
+	if err == nil || err.Error() != "create Colab runtime: NO_CAPACITY" {
+		t.Fatalf("unexpected runtime error: %v", err)
+	}
+}
 
 func TestOAuthRefreshesExpiringAccessToken(t *testing.T) {
 	var requests atomic.Int32

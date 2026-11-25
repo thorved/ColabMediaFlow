@@ -31,27 +31,32 @@ type archiveFailure struct {
 }
 
 type report struct {
-	Done      bool             `json:"done"`
-	Scanned   int              `json:"scanned"`
-	Processed int              `json:"processed"`
-	Skipped   int              `json:"skipped"`
-	Failures  []archiveFailure `json:"failures"`
-	Resolved  []string         `json:"resolved"`
-	Error     string           `json:"error"`
+	Done           bool             `json:"done"`
+	ScanComplete   bool             `json:"scan_complete"`
+	Scanned        int              `json:"scanned"`
+	Processed      int              `json:"processed"`
+	Skipped        int              `json:"skipped"`
+	Failures       []archiveFailure `json:"failures"`
+	Resolved       []string         `json:"resolved"`
+	Error          string           `json:"error"`
+	CurrentArchive *archiveProgress `json:"current_archive"`
 }
 
 type runResult struct {
-	ID         string           `json:"id"`
-	Trigger    string           `json:"trigger"`
-	Status     string           `json:"status"`
-	CreatedAt  time.Time        `json:"created_at"`
-	StartedAt  *time.Time       `json:"started_at,omitempty"`
-	FinishedAt *time.Time       `json:"finished_at,omitempty"`
-	Scanned    int              `json:"scanned"`
-	Processed  int              `json:"processed"`
-	Skipped    int              `json:"skipped"`
-	Failures   []archiveFailure `json:"failures"`
-	Error      string           `json:"error,omitempty"`
+	ID                string           `json:"id"`
+	Trigger           string           `json:"trigger"`
+	Status            string           `json:"status"`
+	CreatedAt         time.Time        `json:"created_at"`
+	StartedAt         *time.Time       `json:"started_at,omitempty"`
+	FinishedAt        *time.Time       `json:"finished_at,omitempty"`
+	ScanComplete      bool             `json:"scan_complete"`
+	Scanned           int              `json:"scanned"`
+	Processed         int              `json:"processed"`
+	Skipped           int              `json:"skipped"`
+	Failures          []archiveFailure `json:"failures"`
+	Error             string           `json:"error,omitempty"`
+	CurrentArchive    *archiveProgress `json:"current_archive,omitempty"`
+	ProgressUpdatedAt *time.Time       `json:"progress_updated_at,omitempty"`
 }
 
 type runState struct {
@@ -119,6 +124,10 @@ func (s *store) getRun(ctx context.Context, id string) (*runState, error) {
 
 func (s *store) activeRun(ctx context.Context) (*runState, error) {
 	return scanRun(s.db.QueryRowContext(ctx, "SELECT body FROM runs WHERE active = 1"))
+}
+
+func (s *store) latestRun(ctx context.Context) (*runState, error) {
+	return scanRun(s.db.QueryRowContext(ctx, "SELECT body FROM runs ORDER BY rowid DESC LIMIT 1"))
 }
 
 func scanRun(row *sql.Row) (*runState, error) {

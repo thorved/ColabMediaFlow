@@ -13,7 +13,7 @@ If you already have a configured `.env`, keep it. Otherwise, copy `.env.example`
 | `DRIVE_DOWNLOAD_FOLDER_ID` | Drive ID of `Media/download` or another folder to scan |
 | `NOTEBOOK_PARENT_FOLDER_ID` | Drive ID of the folder where the managed notebook belongs |
 | `API_KEY` | Random local bearer key for API requests |
-| `RUN_INTERVAL` | Go duration such as `1m` or `30s`. Defaults to `1m`. Set it to `0` for manual runs only. |
+| `RUN_INTERVAL` | Go duration such as `1m` or `30s`. Defaults to `1m`. Set it to `0` to prepare the notebook at startup and run it manually. |
 | `LISTEN_ADDR` | API listen address. Defaults to `127.0.0.1:8080` for native runs and `0.0.0.0:8080` inside the container. |
 | `STATE_DB` | Local SQLite path. Defaults to `colabmediaflow.db` in the working directory. |
 
@@ -41,19 +41,23 @@ docker run --rm --name colabmediaflow --env-file .env `
     colabmediaflow:local
 ```
 
-Reuse `colabmediaflow-data` when replacing the container. A new volume starts with fresh state, so create the notebook through the API before scheduling. Run one service instance per workflow.
+Reuse `colabmediaflow-data` when replacing the container. A new volume starts with fresh state and the service sets up the notebook automatically. Run one service instance per workflow.
 
 ## Use the API
 
-Create the notebook from another PowerShell terminal in the same checkout. Successful creation enables its timer. Repeating the request returns the same notebook and restores the bundled code if it was changed in Drive.
+On startup the service creates or updates its managed notebook and starts a run immediately. It resumes an active run found in SQLite before resuming its interval. The API is available during notebook setup and reports setup errors while the service retries. Use `PUT /v1/notebook` to restore the bundled notebook code on demand.
+
+Check the workflow from another PowerShell terminal in the same checkout.
 
 ```powershell
 $base = 'http://127.0.0.1:8080'
 $apiKey = (Get-Content .env | Where-Object { $_ -like 'API_KEY=*' } | Select-Object -First 1) -replace '^API_KEY=', ''
 $headers = @{ Authorization = "Bearer $apiKey" }
 
-Invoke-RestMethod -Method Put -Uri "$base/v1/notebook" -Headers $headers
+Invoke-RestMethod -Uri "$base/v1/status" -Headers $headers
 ```
+
+The response includes the notebook setup status and the active or latest run. `scanned` is the number of ZIP and RAR archives found in that run’s Drive scan. `processed`, `skipped`, `failed`, `remaining`, and `progress_percent` show how far that scan has progressed. Failed and skipped archives count as checked for the current run. `remaining` and `progress_percent` are `null` until scanning finishes. While an archive is active, `current_archive` shows its phase and, during a transfer or extraction, bytes done and total bytes for that operation. The same progress fields are available on `GET /v1/runs/{id}`.
 
 Queue a manual run and query its status.
 
@@ -88,7 +92,7 @@ python -m unittest discover -s internal/app/notebook -v
 
 Install `rarfile==4.5` in your local Python environment to include the RAR fixture in the worker tests. The Colab worker sets up its own RAR support when needed.
 
-The optional live test uses the OAuth settings from `.env` and provisions a temporary Drive folder and Colab CPU runtime for the test. It verifies notebook reuse, extracted Drive file contents, archive movement, and an empty scheduled run before cleaning up its test resources.
+The optional live test uses the OAuth settings from `.env` and provisions a temporary Drive folder and Colab CPU runtime for the test. It verifies automatic notebook setup and startup execution, the status API, extracted Drive file contents, archive movement, notebook reuse, and an empty scheduled run before cleaning up its test resources.
 
 Set `COLAB_MEDIA_FLOW_LIVE_RAR_FIXTURE` to the path of a small, standalone RAR fixture to include RAR in the live test.
 

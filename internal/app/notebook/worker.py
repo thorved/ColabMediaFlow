@@ -158,7 +158,7 @@ class Drive:
                 raise
         return file_id
 
-    def download(self, item, target):
+    def download(self, item, target, on_bytes):
         size = int(item["size"])
         require_space(target.parent, size)
         url = DRIVE + "files/" + parse.quote(item["id"], safe="") + "?alt=media"
@@ -177,6 +177,7 @@ class Drive:
                     raise DriveError("Drive returned an incomplete archive range", 502)
                 destination.write(body)
                 digest.update(body)
+                on_bytes(end + 1)
         if item.get("md5Checksum") and digest.hexdigest() != item["md5Checksum"]:
             raise ArchiveError("Archive content changed or was incomplete during download")
 
@@ -198,7 +199,7 @@ class Drive:
             if existing.get("size") != "0":
                 raise
 
-    def _upload_session(self, location, source, size):
+    def _upload_session(self, location, source, size, on_bytes):
         offset = 0
         stalled = 0
         while offset < size:
@@ -220,6 +221,7 @@ class Drive:
                     headers={"Content-Range": f"bytes */{size}"},
                 )
             if status in (200, 201):
+                on_bytes(size)
                 return
             received = headers.get("Range", "")
             match = re.fullmatch(r"bytes=0-(\d+)", received)
@@ -232,14 +234,16 @@ class Drive:
             if stalled >= 4:
                 raise DriveError("Drive resumable upload stopped making progress", 502)
             offset = new_offset
+            on_bytes(offset)
 
-    def upload(self, parent, name, path, size, checksum):
+    def upload(self, parent, name, path, size, checksum, on_bytes):
         file_id = self.new_id()
         metadata = {"id": file_id, "name": name, "parents": [parent]}
         if not size:
             self._upload_empty(file_id, metadata)
             return
         for attempt in range(3):
+            on_bytes(0)
             try:
                 _, headers, _ = self.request(
                     "POST", UPLOAD + "?uploadType=resumable", expect=(200, 201),
@@ -254,7 +258,7 @@ class Drive:
                 if not location:
                     raise DriveError("Drive did not provide a resumable upload URL", 502)
                 with path.open("rb") as source:
-                    self._upload_session(location, source, size)
+                    self._upload_session(location, source, size, on_bytes)
                 return
             except DriveError as exc:
                 if exc.status not in (404, 409, 410) and not exc.retryable:
@@ -268,6 +272,7 @@ class Drive:
                         raise exc from None
                     continue
                 if written.get("size") == str(size) and written.get("md5Checksum") == checksum:
+                    on_bytes(size)
                     return
                 raise DriveError("Drive upload metadata did not match the staged file", 502)
 
@@ -355,7 +360,7 @@ def archive_members(archive, is_zip):
     return result
 
 
-def extract_members(archive, is_zip, drive, output_parent, name, scratch):
+def extract_members(archive, is_zip, drive, output_parent, name, scratch, progress):
     members = archive_members(archive, is_zip)
     root = drive.folder(output_parent, name)
     folders = {(): root}
@@ -375,6 +380,8 @@ def extract_members(archive, is_zip, drive, output_parent, name, scratch):
             raise ArchiveError("An extracted file path is already used by a Drive folder")
         require_space(scratch, entry.file_size)
         checksum = hashlib.md5(usedforsecurity=False)
+        member = "/".join(parts)
+        progress.phase("extracting", entry.file_size, member)
         try:
             with archive.open(entry) as source, staged.open("wb") as destination:
                 remaining = entry.file_size
@@ -385,9 +392,13 @@ def extract_members(archive, is_zip, drive, output_parent, name, scratch):
                     destination.write(data)
                     checksum.update(data)
                     remaining -= len(data)
+                    progress.bytes_done(entry.file_size - remaining)
                 if source.read(1):
                     raise ArchiveError("Archive member exceeds its declared size", True)
-            drive.upload(parent, parts[-1], staged, entry.file_size, checksum.hexdigest())
+            progress.phase("uploading", entry.file_size, member)
+            drive.upload(
+                parent, parts[-1], staged, entry.file_size, checksum.hexdigest(), progress.bytes_done,
+            )
         finally:
             staged.unlink(missing_ok=True)
 
@@ -423,7 +434,7 @@ def install(args):
         raise ArchiveError("Colab could not install the RAR decompression support") from None
 
 
-def process_archive(drive, item, input_id, output_id, processed_id, work_dir):
+def process_archive(drive, item, input_id, output_id, processed_id, work_dir, progress):
     stem, extension = os.path.splitext(item["name"])
     if safe_parts(stem, False) != (stem,):
         raise ArchiveError("Archive has an unsafe filename", True)
@@ -431,11 +442,13 @@ def process_archive(drive, item, input_id, output_id, processed_id, work_dir):
     with tempfile.TemporaryDirectory(dir=work_dir) as temporary:
         scratch = Path(temporary)
         path = scratch / ("archive.zip" if is_zip else "archive.rar")
-        drive.download(item, path)
+        progress.phase("downloading", int(item["size"]))
+        drive.download(item, path, progress.bytes_done)
+        progress.phase("reading_archive")
         if is_zip:
             try:
                 with zipfile.ZipFile(path) as archive:
-                    extract_members(archive, True, drive, output_id, stem, scratch)
+                    extract_members(archive, True, drive, output_id, stem, scratch, progress)
             except (zipfile.BadZipFile, EOFError, UnicodeError, lzma.LZMAError, zlib.error):
                 raise ArchiveError("ZIP archive is corrupt", True) from None
         else:
@@ -448,7 +461,7 @@ def process_archive(drive, item, input_id, output_id, processed_id, work_dir):
                         raise ArchiveError("Archive is password-protected", True)
                     if any(m.compress_type != rarfile.RAR_M0 for m in archive.infolist()):
                         prepare_rar_backend(rarfile)
-                    extract_members(archive, False, drive, output_id, stem, scratch)
+                    extract_members(archive, False, drive, output_id, stem, scratch, progress)
             except (rarfile.PasswordRequired, rarfile.RarWrongPassword, rarfile.NoCrypto):
                 raise ArchiveError("Archive is password-protected", True) from None
             except (rarfile.BadRarFile, rarfile.NotRarFile, rarfile.RarCRCError, EOFError, UnicodeError):
@@ -457,6 +470,7 @@ def process_archive(drive, item, input_id, output_id, processed_id, work_dir):
                 raise ArchiveError("Multipart RAR archives are unsupported", True) from None
             except rarfile.RarCannotExec:
                 raise ArchiveError("Colab RAR decompression backend is unavailable") from None
+    progress.phase("moving")
     drive.move_archive(item, input_id, processed_id)
 
 
@@ -464,6 +478,33 @@ def save_report(directory, report):
     temporary = directory / "report.tmp"
     temporary.write_text(json.dumps(report, ensure_ascii=True), encoding="utf-8")
     temporary.replace(directory / "report.json")
+
+
+class ArchiveProgress:
+    def __init__(self, directory, report, item):
+        self.directory = directory
+        self.report = report
+        self.item = item
+        self.last_write = 0
+
+    def publish(self):
+        save_report(self.directory, self.report)
+        self.last_write = time.monotonic()
+
+    def phase(self, name, total=None, member=None):
+        current = {"file_id": self.item["id"], "name": self.item["name"], "phase": name}
+        if total is not None:
+            current.update(bytes_done=0, bytes_total=total)
+        if member:
+            current["member"] = member
+        self.report["current_archive"] = current
+        self.publish()
+
+    def bytes_done(self, count):
+        current = self.report["current_archive"]
+        current["bytes_done"] = count
+        if count == current["bytes_total"] or time.monotonic() - self.last_write >= 1:
+            self.publish()
 
 
 def run_worker(directory):
@@ -475,6 +516,8 @@ def run_worker(directory):
         # An earlier call may have completed some archives before the kernel stopped.
     else:
         report = {"done": False, "scanned": 0, "processed": 0, "skipped": 0, "failures": [], "resolved": []}
+    report.update(scan_complete=False, current_archive=None)
+    save_report(directory, report)
     try:
         settings = json.loads((directory / "settings.json").read_text(encoding="utf-8"))
         drive = Drive(directory / "oauth.json")
@@ -489,16 +532,20 @@ def run_worker(directory):
             if ("size" in item and not item["mimeType"].startswith("application/vnd.google-apps.")
                 and os.path.splitext(item["name"])[1].lower() in (".zip", ".rar"))
         ]
-        report["scanned"] = report["processed"] + len(items)
-        report["skipped"] = 0
-        report["failures"] = []
         known_bad = settings["bad_versions"] or {}
-        for item in sorted(items, key=lambda item: (item["name"], item["id"])):
-            if not settings["retry_failed"] and known_bad.get(item["id"]) == item["version"]:
-                report["skipped"] += 1
-                continue
+        pending = [
+            item for item in items
+            if settings["retry_failed"] or known_bad.get(item["id"]) != item["version"]
+        ]
+        report["scan_complete"] = True
+        report["scanned"] = report["processed"] + len(items)
+        report["skipped"] = len(items) - len(pending)
+        report["failures"] = []
+        save_report(directory, report)
+        for item in sorted(pending, key=lambda item: (item["name"], item["id"])):
+            progress = ArchiveProgress(directory, report, item)
             try:
-                process_archive(drive, item, input_id, output_id, processed_id, directory)
+                process_archive(drive, item, input_id, output_id, processed_id, directory, progress)
             except Exception as exc:
                 report["failures"].append({
                     "file_id": item["id"], "version": item["version"], "name": item["name"],
@@ -508,9 +555,11 @@ def run_worker(directory):
             else:
                 report["processed"] += 1
                 report["resolved"].append(item["id"])
+            report["current_archive"] = None
             save_report(directory, report)
     except Exception as exc:
         report["error"] = safe_detail(exc)
     finally:
         report["done"] = True
+        report["current_archive"] = None
         save_report(directory, report)

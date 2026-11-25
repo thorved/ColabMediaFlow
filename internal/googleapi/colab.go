@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -34,8 +35,14 @@ type operation struct {
 	Error *struct {
 		Code    int
 		Message string
+		Details []struct {
+			Type   string `json:"@type"`
+			Reason string
+		}
 	}
 }
+
+var errorInfoReason = regexp.MustCompile("^[A-Z][A-Z0-9_]{0,61}[A-Z0-9]$")
 
 func (g *Client) getRuntime(ctx context.Context, name string) (colabRuntime, error) {
 	var instance colabRuntime
@@ -125,7 +132,17 @@ func (g *Client) waitRuntimeCreation(ctx context.Context, job operation) error {
 		}
 	}
 	if job.Error != nil {
-		return &googleError{operation: "create Colab runtime", rpcCode: job.Error.Code, reason: googleReason(job.Error.Message)}
+		reason := googleReason(job.Error.Message)
+		for _, detail := range job.Error.Details {
+			if strings.HasSuffix(detail.Type, "/google.rpc.ErrorInfo") && errorInfoReason.MatchString(detail.Reason) {
+				reason = detail.Reason
+				break
+			}
+		}
+		if reason == "" && job.Error.Code == 9 {
+			reason = "FAILED_PRECONDITION"
+		}
+		return &googleError{operation: "create Colab runtime", rpcCode: job.Error.Code, reason: reason}
 	}
 	return nil
 }

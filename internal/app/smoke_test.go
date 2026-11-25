@@ -102,19 +102,6 @@ func TestLiveColabWorkflow(t *testing.T) {
 		}
 		expectedArchives++
 	}
-	var notebook struct {
-		ID string `json:"file_id"`
-	}
-	liveAPI(t, ctx, server.URL, cfg.apiKey, http.MethodPut, "/v1/notebook", http.StatusCreated, &notebook)
-	t.Logf("created managed notebook %s", notebook.ID)
-	var reused struct {
-		ID string `json:"file_id"`
-	}
-	liveAPI(t, ctx, server.URL, cfg.apiKey, http.MethodPut, "/v1/notebook", http.StatusOK, &reused)
-	if notebook.ID != reused.ID {
-		t.Fatal("notebook PUT created a duplicate")
-	}
-
 	workerCtx, stopWorker := context.WithCancel(ctx)
 	workerDone := make(chan struct{})
 	go func() {
@@ -126,13 +113,30 @@ func TestLiveColabWorkflow(t *testing.T) {
 		<-workerDone
 	}()
 
-	var run runResult
-	liveAPI(t, ctx, server.URL, cfg.apiKey, http.MethodPost, "/v1/runs", http.StatusAccepted, &run)
-	t.Logf("queued manual run %s", run.ID)
-	finished := waitForLiveRun(t, ctx, server.URL, cfg.apiKey, run.ID)
-	if finished.Status != runSucceeded || finished.Processed != expectedArchives || finished.Scanned != expectedArchives {
-		t.Fatalf("manual run returned %+v", finished)
+	timerCtx, stopTimer := context.WithCancel(ctx)
+	timerDone := make(chan struct{})
+	go func() {
+		defer close(timerDone)
+		svc.automate(timerCtx, false)
+	}()
+	defer func() {
+		stopTimer()
+		<-timerDone
+	}()
+	initial := waitForLiveTrigger(t, ctx, server.URL, cfg.apiKey, "startup")
+	if initial.Notebook.Status != "ready" || initial.Notebook.FileID == "" {
+		t.Fatalf("notebook did not initialize automatically: %+v", initial.Notebook)
 	}
+	t.Logf("created notebook %s and queued startup run %s", initial.Notebook.FileID, initial.Run.ID)
+	finished := waitForLiveRun(t, ctx, server.URL, cfg.apiKey, initial.Run.ID)
+	if finished.Status != runSucceeded || finished.Processed != expectedArchives || finished.Scanned != expectedArchives ||
+		finished.Remaining == nil || *finished.Remaining != 0 ||
+		finished.ProgressPercent == nil || *finished.ProgressPercent != 100 {
+		t.Fatalf("startup run returned %+v", finished)
+	}
+	scheduled := waitForLiveTrigger(t, ctx, server.URL, cfg.apiKey, "scheduled")
+	stopTimer()
+	t.Logf("observed scheduled run %s", scheduled.Run.ID)
 	moved, err := g.ReadDriveFile(ctx, source.ID)
 	if err != nil {
 		t.Fatal(err)
@@ -158,28 +162,16 @@ func TestLiveColabWorkflow(t *testing.T) {
 		t.Fatalf("empty extracted file has %d bytes: %v", len(extracted), err)
 	}
 
-	timerCtx, stopTimer := context.WithCancel(ctx)
-	defer stopTimer()
-	go svc.scheduler(timerCtx)
-	var scheduledID string
-	for scheduledID == "" {
-		active, err := state.activeRun(ctx)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if active != nil && active.Trigger == "scheduled" {
-			scheduledID = active.ID
-			stopTimer()
-			break
-		}
-		if err := pause(ctx, 250*time.Millisecond); err != nil {
-			t.Fatal(err)
-		}
-	}
-	t.Logf("observed scheduled run %s", scheduledID)
-	empty := waitForLiveRun(t, ctx, server.URL, cfg.apiKey, scheduledID)
-	if empty.Status != runSucceeded || empty.Scanned != 0 {
+	empty := waitForLiveRun(t, ctx, server.URL, cfg.apiKey, scheduled.Run.ID)
+	if empty.Status != runSucceeded || empty.Scanned != 0 || empty.Remaining == nil || *empty.Remaining != 0 {
 		t.Fatalf("scheduled empty run returned %+v", empty)
+	}
+	var reused struct {
+		ID string `json:"file_id"`
+	}
+	liveAPI(t, ctx, server.URL, cfg.apiKey, http.MethodPut, "/v1/notebook", http.StatusOK, &reused)
+	if initial.Notebook.FileID != reused.ID {
+		t.Fatal("notebook PUT created a duplicate")
 	}
 }
 
@@ -220,11 +212,28 @@ func liveAPI(t *testing.T, ctx context.Context, origin, key, method, path string
 	}
 }
 
-func waitForLiveRun(t *testing.T, ctx context.Context, origin, key, id string) runResult {
+func waitForLiveTrigger(t *testing.T, ctx context.Context, origin, key, trigger string) workflowView {
+	t.Helper()
+	for {
+		var view workflowView
+		liveAPI(t, ctx, origin, key, http.MethodGet, "/v1/status", http.StatusOK, &view)
+		if view.Notebook.Error != "" {
+			t.Fatalf("automatic notebook setup: %s", view.Notebook.Error)
+		}
+		if view.Notebook.Status == "ready" && view.Run != nil && view.Run.Trigger == trigger {
+			return view
+		}
+		if err := pause(ctx, time.Second); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func waitForLiveRun(t *testing.T, ctx context.Context, origin, key, id string) runView {
 	t.Helper()
 	path := fmt.Sprintf("/v1/runs/%s", id)
 	for {
-		var run runResult
+		var run runView
 		liveAPI(t, ctx, origin, key, http.MethodGet, path, http.StatusOK, &run)
 		if run.FinishedAt != nil {
 			return run

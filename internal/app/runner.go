@@ -6,8 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"log"
-
+	"reflect"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -17,8 +18,9 @@ import (
 const runBudget = 6 * time.Hour
 
 type runner struct {
-	google *googleapi.Client
-	state  *store
+	google         *googleapi.Client
+	state          *store
+	notebookParent string
 }
 
 func runDirectory(id string) string {
@@ -28,12 +30,19 @@ func runDirectory(id string) string {
 func (r *runner) prepare(ctx context.Context, run *runState) error {
 	if run.Code == "" {
 		data, err := r.google.DownloadDriveFile(ctx, run.NotebookID)
-		if err != nil {
+		if err != nil && !googleapi.IsNotFound(err) {
 			return err
 		}
 		cells, err := verifiedCode(data)
 		if err != nil {
-			return err
+			// A queued run from a previous release has no remote execution to
+			// reattach to. Restore the current worker before dispatching it.
+			id, _, err := ensureNotebook(ctx, r.google, r.state, r.notebookParent)
+			if err != nil {
+				return err
+			}
+			cells = notebookCode()
+			run.NotebookID = id
 		}
 		run.Code = "MEDIA_FLOW_RUN_PATH = " + string(encodeJSON("/"+runDirectory(run.ID))) + "\n" + strings.Join(cells, "\n")
 		run.RuntimeName, err = r.state.metadata(ctx, "runtime_name")
@@ -126,6 +135,29 @@ func (r *runner) refreshDuringRun(ctx context.Context, run *runState, last strin
 	}
 }
 
+func (r *runner) watchProgress(ctx context.Context, snapshot runState) {
+	ticker := time.NewTicker(3 * time.Second)
+	defer ticker.Stop()
+	var last report
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		result, err := r.report(ctx, &snapshot)
+		if err != nil || (!result.hasProgress() && !result.Done) || reflect.DeepEqual(last, result) {
+			continue
+		}
+		snapshot.applyReport(result)
+		if err := r.state.saveRun(ctx, &snapshot); err == nil {
+			last = result
+		} else if ctx.Err() == nil {
+			log.Printf("run %s: store progress: %v", snapshot.ID, err)
+		}
+	}
+}
+
 func (r *runner) execute(ctx context.Context, run *runState) (report, bool, error) {
 	if err := r.prepare(ctx, run); err != nil {
 		return report{}, false, err
@@ -149,15 +181,14 @@ func (r *runner) execute(ctx context.Context, run *runState) (report, bool, erro
 	if err := r.state.saveRun(ctx, run); err != nil {
 		return report{}, false, err
 	}
-	refreshCtx, stopRefresh := context.WithCancel(ctx)
-	refreshDone := make(chan struct{})
-	go func() {
-		defer close(refreshDone)
-		r.refreshDuringRun(refreshCtx, run, token)
-	}()
+	monitorCtx, stopMonitors := context.WithCancel(ctx)
+	var monitors sync.WaitGroup
+	monitors.Go(func() { r.refreshDuringRun(monitorCtx, run, token) })
+	snapshot := *run
+	monitors.Go(func() { r.watchProgress(monitorCtx, snapshot) })
 	defer func() {
-		stopRefresh()
-		<-refreshDone
+		stopMonitors()
+		monitors.Wait()
 	}()
 
 	delay := time.Second

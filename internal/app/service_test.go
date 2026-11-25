@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/thorved/ColabMediaFlow/internal/googleapi"
 	"io"
 	"mime"
 	"mime/multipart"
@@ -16,6 +15,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/thorved/ColabMediaFlow/internal/googleapi"
 )
 
 type apiFixture struct {
@@ -27,9 +28,12 @@ type apiFixture struct {
 	runtimeName  string
 	scratch      bool
 	report       *report
+	finalReport  *report
 	tokenCalls   atomic.Int32
 	workCalls    atomic.Int32
 	createCalls  atomic.Int32
+	updateCalls  atomic.Int32
+	parentError  atomic.Bool
 	executionIDs []string
 	workStarted  chan struct{}
 	continueWork chan struct{}
@@ -76,6 +80,10 @@ func (f *apiFixture) handle(w http.ResponseWriter, r *http.Request) {
 		number := f.tokenCalls.Add(1)
 		fmt.Fprintf(w, "{\"access_token\":\"access-%d\",\"expires_in\":3600}", number)
 	case r.URL.Path == "/drive/files/parent":
+		if f.parentError.Load() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
 		writeFixtureJSON(w, googleapi.DriveFile{ID: "parent", MimeType: googleapi.FolderMIME})
 	case r.URL.Path == "/drive/files/generateIds":
 		writeFixtureJSON(w, map[string][]string{"ids": {"notebook-id"}})
@@ -90,7 +98,7 @@ func (f *apiFixture) handle(w http.ResponseWriter, r *http.Request) {
 		default:
 			writeFixtureJSON(w, f.notebook)
 		}
-	case r.URL.Path == "/upload/files":
+	case r.URL.Path == "/upload/files" || r.URL.Path == "/upload/files/notebook-id":
 		f.upload(w, r)
 	case r.URL.Path == "/v1beta/runtimespecs":
 		w.Write([]byte("{\"runtimeSpecs\":[{\"key\":{\"variant\":\"VARIANT_CPU\",\"accelerator\":\"NONE\",\"shape\":\"SHAPE_STANDARD\"},\"eligible\":true}]}"))
@@ -140,9 +148,17 @@ func (f *apiFixture) upload(w http.ResponseWriter, r *http.Request) {
 		f.t.Error(err)
 		return
 	}
-	if err := json.NewDecoder(first).Decode(&f.notebook); err != nil {
+	var metadata googleapi.DriveFile
+	if err := json.NewDecoder(first).Decode(&metadata); err != nil {
 		f.t.Error(err)
 		return
+	}
+	if r.Method == http.MethodPatch {
+		f.notebook.Name = metadata.Name
+		f.updateCalls.Add(1)
+	} else {
+		f.notebook = metadata
+		f.createCalls.Add(1)
 	}
 	second, err := parts.NextPart()
 	if err != nil {
@@ -154,7 +170,6 @@ func (f *apiFixture) upload(w http.ResponseWriter, r *http.Request) {
 		f.t.Error(err)
 		return
 	}
-	f.createCalls.Add(1)
 	writeFixtureJSON(w, f.notebook)
 }
 
@@ -230,7 +245,10 @@ func (f *apiFixture) mcp(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			f.mu.Lock()
-			f.report = &report{Done: true, Failures: []archiveFailure{}}
+			f.report = f.finalReport
+			if f.report == nil {
+				f.report = &report{Done: true, ScanComplete: true, Failures: []archiveFailure{}}
+			}
 			f.mu.Unlock()
 		} else if strings.Contains(args["code"], "shutil.rmtree(scratch)") {
 			f.mu.Lock()
@@ -410,12 +428,21 @@ func TestRestartReattachesToSameExecution(t *testing.T) {
 		t.Fatalf("incomplete persisted run: %+v, %v", before, err)
 	}
 	expectAPI(t, second, http.MethodPost, "/v1/runs", "", http.StatusConflict)
+	if recovering, err := second.bootstrap(t.Context(), true); err != nil || !recovering {
+		t.Fatalf("startup did not recognize the persisted run: %v, %v", recovering, err)
+	}
 	if err := second.advance(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	after, err := db.getRun(t.Context(), run.ID)
 	if err != nil || after.Status != runSucceeded || after.FinishedAt == nil {
 		t.Fatalf("recovered run: %+v, %v", after, err)
+	}
+	if recovering, err := second.bootstrap(t.Context(), false); err != nil || recovering {
+		t.Fatalf("startup did not finish after recovery: %v, %v", recovering, err)
+	}
+	if latest, err := db.latestRun(t.Context()); err != nil || latest == nil || latest.ID != run.ID {
+		t.Fatalf("startup duplicated the recovered run: %+v, %v", latest, err)
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()

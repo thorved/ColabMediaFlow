@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -18,7 +19,7 @@ import (
 )
 
 var (
-	errNoNotebook   = errors.New("create the managed notebook with PUT /v1/notebook before running it")
+	errNoNotebook   = errors.New("the managed notebook is still initializing")
 	errNotebookBusy = errors.New("the managed notebook is being updated")
 )
 
@@ -27,11 +28,15 @@ type service struct {
 	store      *store
 	runner     *runner
 	notebookMu sync.Mutex
+	setup      atomic.Pointer[notebookSetup]
 	wake       chan struct{}
 }
 
 func newService(cfg config, db *store, google *googleapi.Client) *service {
-	return &service{cfg: cfg, store: db, runner: &runner{google: google, state: db}, wake: make(chan struct{}, 1)}
+	return &service{
+		cfg: cfg, store: db, wake: make(chan struct{}, 1),
+		runner: &runner{google: google, state: db, notebookParent: cfg.notebookParent},
+	}
 }
 
 func (s *service) signalWorker() {
@@ -54,9 +59,15 @@ func (s *service) queue(ctx context.Context, trigger string, retryFailed bool) (
 	if err != nil {
 		return nil, false, err
 	}
-	if id == "" {
+	setup := s.setup.Load()
+	if id == "" || (setup != nil && setup.Status != "ready") {
 		return nil, false, errNoNotebook
 	}
+	return s.enqueue(ctx, id, trigger, retryFailed)
+}
+
+// enqueue reserves the worker slot while notebookMu is held.
+func (s *service) enqueue(ctx context.Context, id, trigger string, retryFailed bool) (*runState, bool, error) {
 	run := &runState{
 		runResult: runResult{
 			ID: uuid.NewString(), Trigger: trigger, Status: runQueued,
@@ -144,6 +155,15 @@ func (s *service) advance(ctx context.Context) error {
 				}
 			}
 		}
+		if !result.Done && !result.hasProgress() {
+			observed, err := s.store.getRun(ctx, run.ID)
+			if err != nil {
+				return err
+			}
+			if observed != nil {
+				run.runResult = observed.runResult
+			}
+		}
 		run.updateOutcome(result, settled, runErr)
 		if err := s.store.recordReport(ctx, run, result); err != nil {
 			return err
@@ -164,10 +184,8 @@ func (s *service) advance(ctx context.Context) error {
 func (run *runState) updateOutcome(result report, settled bool, executionErr error) {
 	run.Status = runCleaning
 	run.Settled = settled
-	run.Scanned, run.Processed, run.Skipped = result.Scanned, result.Processed, result.Skipped
-	if result.Failures != nil {
-		run.Failures = result.Failures
-	}
+	run.applyReport(result)
+	run.CurrentArchive = nil
 	run.Error = result.Error
 	if executionErr != nil {
 		run.Error = executionErr.Error()
@@ -175,9 +193,9 @@ func (run *runState) updateOutcome(result report, settled bool, executionErr err
 	switch {
 	case run.Error != "":
 		run.FinalStatus = runFailed
-	case len(result.Failures) > 0 && result.Processed > 0:
+	case len(run.Failures) > 0 && run.Processed > 0:
 		run.FinalStatus = runPartial
-	case len(result.Failures) > 0:
+	case len(run.Failures) > 0:
 		run.FinalStatus = runFailed
 	default:
 		run.FinalStatus = runSucceeded
@@ -200,6 +218,7 @@ func (s *service) router() *gin.Engine {
 		}
 	})
 	api.PUT("/notebook", s.putNotebook)
+	api.GET("/status", s.getStatus)
 	api.POST("/runs", s.postRun)
 	api.GET("/runs/:id", s.getRun)
 	return router
@@ -230,7 +249,9 @@ func (s *service) putNotebook(c *gin.Context) {
 	if created {
 		status = http.StatusCreated
 	}
-	c.JSON(status, gin.H{"file_id": id, "colab_url": "https://colab.research.google.com/drive/" + id})
+	setup := readyNotebook(id)
+	s.setup.Store(setup)
+	c.JSON(status, gin.H{"file_id": setup.FileID, "colab_url": setup.ColabURL})
 }
 
 func (s *service) postRun(c *gin.Context) {
@@ -260,7 +281,7 @@ func (s *service) postRun(c *gin.Context) {
 		c.JSON(http.StatusConflict, gin.H{"error": "the run slot changed, retry the request"})
 	default:
 		c.Header("Location", "/v1/runs/"+run.ID)
-		c.JSON(http.StatusAccepted, run.runResult)
+		c.JSON(http.StatusAccepted, run.view())
 	}
 }
 
@@ -274,5 +295,5 @@ func (s *service) getRun(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "run not found"})
 		return
 	}
-	c.JSON(http.StatusOK, run.runResult)
+	c.JSON(http.StatusOK, run.view())
 }

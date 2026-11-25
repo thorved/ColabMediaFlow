@@ -30,6 +30,14 @@ func Run(ctx context.Context) error {
 	}
 	defer state.db.Close()
 	svc := newService(cfg, state, googleapi.New(cfg.clientID, cfg.clientSecret, cfg.refreshToken, googleapi.Options{}))
+	active, err := state.activeRun(ctx)
+	if err != nil {
+		return err
+	}
+	svc.setup.Store(&notebookSetup{Status: "initializing"})
+	if active != nil {
+		svc.setup.Store(&notebookSetup{Status: "recovering"})
+	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	gin.SetMode(gin.ReleaseMode)
@@ -40,7 +48,7 @@ func Run(ctx context.Context) error {
 
 	var background sync.WaitGroup
 	background.Go(func() { svc.worker(ctx) })
-	background.Go(func() { svc.scheduler(ctx) })
+	background.Go(func() { svc.automate(ctx, active != nil) })
 	served := make(chan error, 1)
 	go func() { served <- server.Serve(listener) }()
 	log.Printf("ColabMediaFlow listening on http://%s", listener.Addr())

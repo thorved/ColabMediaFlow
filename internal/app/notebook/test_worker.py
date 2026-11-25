@@ -41,15 +41,17 @@ class MemoryDrive:
         })
         return file_id
 
-    def download(self, item, target):
+    def download(self, item, target, on_bytes):
         self.attempted.append(item["id"])
         target.write_bytes(self.archives[item["id"]])
+        on_bytes(len(self.archives[item["id"]]))
 
-    def upload(self, parent, name, path, size, checksum):
+    def upload(self, parent, name, path, size, checksum, on_bytes):
         data = path.read_bytes()
         assert len(data) == size
         assert hashlib.md5(data, usedforsecurity=False).hexdigest() == checksum
         self.add(parent, name, data)
+        on_bytes(size)
 
     def add(self, parent, name, data):
         file_id = parent + "/" + name
@@ -205,12 +207,36 @@ class WorkerTests(unittest.TestCase):
             drive = worker.Drive(Path("unused"))
             interrupted = worker.DriveError("connection interrupted")
             responses = [interrupted, (308, {"Range": "bytes=0-3"}, b""), (201, {}, b"")]
+            offsets = []
             with patch.object(drive, "request", side_effect=responses) as http:
-                drive._upload_session("https://upload", BytesIO(b"abcdefgh"), 8)
+                drive._upload_session("https://upload", BytesIO(b"abcdefgh"), 8, offsets.append)
             self.assertEqual(
                 [(call.kwargs["headers"]["Content-Range"], call.kwargs["data"]) for call in http.call_args_list],
                 [("bytes 0-3/8", b"abcd"), ("bytes */8", b""), ("bytes 4-7/8", b"efgh")],
             )
+            self.assertEqual(offsets, [4, 8])
+
+    def test_publishes_scan_and_archive_progress_before_finishing(self):
+        drive = MemoryDrive({"movie.zip": zip_archive([("nested/video.txt", b"data")])})
+        save = worker.save_report
+        snapshots = []
+
+        def observe(directory, report):
+            snapshots.append(json.loads(json.dumps(report)))
+            save(directory, report)
+
+        with patch.object(worker, "save_report", side_effect=observe):
+            result = self.run_job(drive)
+        self.assertFalse(snapshots[0]["scan_complete"])
+        self.assertTrue(snapshots[1]["scan_complete"])
+        self.assertEqual(snapshots[1]["scanned"], 1)
+        phases = [snapshot["current_archive"] for snapshot in snapshots if snapshot["current_archive"]]
+        self.assertEqual({step["phase"] for step in phases},
+                         {"downloading", "reading_archive", "extracting", "uploading", "moving"})
+        self.assertIn({"file_id": "movie.zip", "name": "movie.zip", "phase": "uploading",
+                       "member": "nested/video.txt", "bytes_done": 4, "bytes_total": 4}, phases)
+        self.assertIsNone(result["current_archive"])
+        self.assertEqual(result["processed"], 1)
 
 
 if __name__ == "__main__":
