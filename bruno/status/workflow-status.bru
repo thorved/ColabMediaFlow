@@ -1,0 +1,16 @@
+meta {
+  name: Workflow status
+  type: http
+  seq: 1
+}
+
+get {
+  url: {{base_url}}/v1/status
+  body: none
+  auth: inherit
+}
+
+docs {
+  Shows notebook readiness and progress for the active or latest run.
+  If a run exists, its ID is available to the Run details request.
+}

@@ -1,0 +1,22 @@
+auth {
+  mode: bearer
+}
+
+auth:bearer {
+  token: {{API_KEY}}
+}
+
+script:post-response {
+  const status = res.getStatus();
+  const body = res.getBody();
+  const runIds = {
+    200: body?.run?.id,
+    202: body?.id,
+    409: body?.active_run_id
+  };
+  const runId = runIds[status];
+
+  if (typeof runId === "string" && runId.length > 0) {
+    bru.setVar("run_id", runId);
+  }
+}

@@ -1,0 +1,21 @@
+meta {
+  name: Retry failed archives
+  type: http
+  seq: 2
+}
+
+post {
+  url: {{base_url}}/v1/runs
+  body: json
+  auth: inherit
+}
+
+body:json {
+  {
+    "retry_failed": true
+  }
+}
+
+docs {
+  Queues a run that also retries archive versions previously marked as failed.
+}

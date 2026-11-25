@@ -1,0 +1,16 @@
+meta {
+  name: Create or repair notebook
+  type: http
+  seq: 3
+}
+
+put {
+  url: {{base_url}}/v1/notebook
+  body: none
+  auth: inherit
+}
+
+docs {
+  Creates the managed notebook or restores its bundled code. Startup normally
+  handles this automatically. Returns 409 while a run is active.
+}

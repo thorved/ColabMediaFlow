@@ -75,6 +75,12 @@ Invoke-RestMethod -Method Post -Uri "$base/v1/runs" -Headers $headers `
 
 The service logs scheduled run IDs. The status API reports `queued`, `running`, `cleaning_up`, `succeeded`, `partial`, or `failed`. A concurrent manual request returns HTTP 409 with the active run ID. The timer skips busy intervals and records empty scans as successful runs. Keep the service running for scheduled execution and keep its SQLite file for restart recovery.
 
+### Use Bruno in VS Code
+
+Open the repository root in VS Code. Install the recommended **Bruno** extension if prompted. The **ColabMediaFlow API** collection appears under **Explorer → Bruno Collections**. Open any request there or from the `bruno/` folder.
+
+Select the **Local** environment and set its secret `API_KEY` to the value from your local `.env`. The default URL is `http://127.0.0.1:8080`. Send **Workflow status** first. It selects the active or latest run for **Run details**. Use the **Actions** folder to start a run, retry failed archives, or repair the notebook.
+
 ## Drive workflow
 
 - The notebook scans standalone ZIP and RAR files directly inside the input folder. It preserves nested paths under `uncompressed_files/<archive stem>` and skips existing output files.

@@ -1,0 +1,16 @@
+meta {
+  name: Start run
+  type: http
+  seq: 1
+}
+
+post {
+  url: {{base_url}}/v1/runs
+  body: none
+  auth: inherit
+}
+
+docs {
+  Queues a manual run. On 202, saves the new run ID for Run details.
+  On 409 with an active run ID, selects that run.
+}

@@ -1,0 +1,22 @@
+meta {
+  name: Run details
+  type: http
+  seq: 2
+}
+
+get {
+  url: {{base_url}}/v1/runs/{{run_id}}
+  body: none
+  auth: inherit
+}
+
+script:pre-request {
+  if (!bru.getVar("run_id") && !bru.getEnvVar("run_id")) {
+    throw new Error("Send Workflow status or Start run first, or set run_id in the Local environment.");
+  }
+}
+
+docs {
+  Shows progress or results for the selected run. To look up a different run,
+  override the run_id runtime variable or clear it and set run_id in Local.
+}
